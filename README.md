@@ -178,9 +178,9 @@ non-zero — the local rotation has already been performed.
 ## Notes & caveats
 
 - Daily backups are identified by being top-level entries of the backup
-  directory that are not one of the tier subdirectories, `logs/`, or
-  `archive/`. Anything else you drop directly in `<backup_dir>` is
-  treated as a daily.
+  directory that are not one of the tier subdirectories, `logs/`,
+  `archive/`, or a top-level file literally named `config.env`. Anything
+  else you drop directly in `<backup_dir>` is treated as a daily.
 - `archive/` grows without bound. Prune it manually when you're sure
   the entries inside are no longer needed; the script will never touch
   it.

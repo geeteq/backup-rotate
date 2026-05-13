@@ -178,6 +178,7 @@ dailies_sorted=$(
         ! -path "$YEARLY_PATH" \
         ! -path "$LOGS_PATH" \
         ! -path "$ARCHIVE_PATH" \
+        ! -name 'config.env' \
         -print0 |
     while IFS= read -r -d '' entry; do
         printf '%s\t%s\n' "$(mtime_of "$entry")" "$entry"
