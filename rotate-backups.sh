@@ -1,49 +1,67 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Config ----------------------------------------------------------------
-MAX_BACKUP_AGE_DAYS=5
-WEEKLY_RETENTION_WEEKS=4
-MONTHLY_RETENTION_MONTHS=12
-YEARLY_RETENTION_YEARS=5
+# --- Load config.env from the script's directory (if present) --------------
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CONFIG_FILE="$SCRIPT_DIR/config.env"
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+fi
 
-WEEKLY_DIRNAME="weekly"
-MONTHLY_DIRNAME="monthly"
-YEARLY_DIRNAME="yearly"
+# Apply defaults for anything not provided by config.env or the environment.
+MAX_BACKUP_AGE_DAYS="${MAX_BACKUP_AGE_DAYS:-5}"
+WEEKLY_RETENTION_WEEKS="${WEEKLY_RETENTION_WEEKS:-4}"
+MONTHLY_RETENTION_MONTHS="${MONTHLY_RETENTION_MONTHS:-12}"
+YEARLY_RETENTION_YEARS="${YEARLY_RETENTION_YEARS:-5}"
 
-# Slack (used only when --slack is passed). Read from the environment.
-#   SLACK_TOKEN    - Slack bot/user token, e.g. xoxb-...
-#   SLACK_CHANNEL  - target channel id or name, e.g. C0123456789 or "#backups"
+WEEKLY_DIRNAME="${WEEKLY_DIRNAME:-weekly}"
+MONTHLY_DIRNAME="${MONTHLY_DIRNAME:-monthly}"
+YEARLY_DIRNAME="${YEARLY_DIRNAME:-yearly}"
+LOGS_DIRNAME="${LOGS_DIRNAME:-logs}"
+LOG_FILENAME="${LOG_FILENAME:-backups.log}"
+
+SLACK_ENABLED="${SLACK_ENABLED:-0}"
 SLACK_TOKEN="${SLACK_TOKEN:-}"
 SLACK_CHANNEL="${SLACK_CHANNEL:-}"
 # ---------------------------------------------------------------------------
 
 usage() {
     cat <<EOF
-Usage: $0 [--slack] [BACKUP_DIR]
+Usage: $0 -d <backup_dir>
 
 Options:
-  --slack       Post a summary to Slack at the end of the run.
-                Requires SLACK_TOKEN and SLACK_CHANNEL in the environment.
-  -h, --help    Show this help.
+  -d <backup_dir>   Base directory to rotate (required).
+  -h, --help        Show this help.
 
-If BACKUP_DIR is omitted, the current directory is used (or \$BACKUP_DIR).
+Configuration is read from:
+  $CONFIG_FILE
 EOF
 }
 
-SLACK_ENABLED=0
-positional=()
+BACKUP_DIR=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --slack)   SLACK_ENABLED=1; shift ;;
+        -d)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                echo "ERROR: -d requires a directory argument" >&2
+                usage >&2
+                exit 2
+            fi
+            BACKUP_DIR="$2"
+            shift 2
+            ;;
         -h|--help) usage; exit 0 ;;
-        --)        shift; positional+=("$@"); break ;;
-        -*)        echo "ERROR: unknown option '$1'" >&2; usage >&2; exit 2 ;;
-        *)         positional+=("$1"); shift ;;
+        *) echo "ERROR: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
     esac
 done
 
-BACKUP_DIR="${positional[0]:-${BACKUP_DIR:-$(pwd)}}"
+if [[ -z "$BACKUP_DIR" ]]; then
+    echo "ERROR: -d <backup_dir> is required" >&2
+    usage >&2
+    exit 2
+fi
+
 BACKUP_DIR="${BACKUP_DIR%/}"
 [[ -z "$BACKUP_DIR" ]] && BACKUP_DIR="/"
 
@@ -56,11 +74,11 @@ warn() {
 
 if (( SLACK_ENABLED )); then
     if [[ -z "$SLACK_TOKEN" || -z "$SLACK_CHANNEL" ]]; then
-        echo "ERROR: --slack requires SLACK_TOKEN and SLACK_CHANNEL in the environment" >&2
+        echo "ERROR: SLACK_ENABLED=1 requires SLACK_TOKEN and SLACK_CHANNEL (set in $CONFIG_FILE or the environment)" >&2
         exit 2
     fi
     if ! command -v curl >/dev/null 2>&1; then
-        echo "ERROR: --slack requires 'curl' to be installed" >&2
+        echo "ERROR: SLACK_ENABLED=1 requires 'curl' to be installed" >&2
         exit 2
     fi
 fi
@@ -69,6 +87,12 @@ if [[ ! -d "$BACKUP_DIR" ]]; then
     echo "ERROR: backup directory '$BACKUP_DIR' does not exist or is not a directory" >&2
     exit 1
 fi
+
+# Tee all subsequent stdout/stderr to a per-backup-dir log file.
+LOGS_PATH="$BACKUP_DIR/$LOGS_DIRNAME"
+LOG_FILE="$LOGS_PATH/$LOG_FILENAME"
+mkdir -p "$LOGS_PATH"
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 # Accumulator for lines that should also appear in the Slack message.
 report_lines=()
@@ -122,6 +146,7 @@ dailies_sorted=$(
         ! -path "$WEEKLY_PATH" \
         ! -path "$MONTHLY_PATH" \
         ! -path "$YEARLY_PATH" \
+        ! -path "$LOGS_PATH" \
         -print0 |
     while IFS= read -r -d '' entry; do
         printf '%s\t%s\n' "$(mtime_of "$entry")" "$entry"
