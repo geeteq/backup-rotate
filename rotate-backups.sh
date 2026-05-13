@@ -20,10 +20,12 @@ MONTHLY_DIRNAME="${MONTHLY_DIRNAME:-monthly}"
 YEARLY_DIRNAME="${YEARLY_DIRNAME:-yearly}"
 LOGS_DIRNAME="${LOGS_DIRNAME:-logs}"
 LOG_FILENAME="${LOG_FILENAME:-backups.log}"
+ARCHIVE_DIRNAME="${ARCHIVE_DIRNAME:-archive}"
 
 SLACK_ENABLED="${SLACK_ENABLED:-0}"
 SLACK_TOKEN="${SLACK_TOKEN:-}"
 SLACK_CHANNEL="${SLACK_CHANNEL:-}"
+SLACK_HTTPS_PROXY="${SLACK_HTTPS_PROXY:-}"
 # ---------------------------------------------------------------------------
 
 usage() {
@@ -120,6 +122,7 @@ cutoff=$(( now - MAX_BACKUP_AGE_DAYS * 86400 ))
 WEEKLY_PATH="$BACKUP_DIR/$WEEKLY_DIRNAME"
 MONTHLY_PATH="$BACKUP_DIR/$MONTHLY_DIRNAME"
 YEARLY_PATH="$BACKUP_DIR/$YEARLY_DIRNAME"
+ARCHIVE_PATH="$BACKUP_DIR/$ARCHIVE_DIRNAME"
 
 for d in "$WEEKLY_PATH" "$MONTHLY_PATH" "$YEARLY_PATH"; do
     if [[ ! -d "$d" ]]; then
@@ -127,15 +130,42 @@ for d in "$WEEKLY_PATH" "$MONTHLY_PATH" "$YEARLY_PATH"; do
         log "created tier directory: $d"
     fi
 done
+if [[ ! -d "$ARCHIVE_PATH" ]]; then
+    mkdir -p "$ARCHIVE_PATH"
+    log "created archive directory: $ARCHIVE_PATH"
+fi
+
+# Moves a path into the archive instead of deleting it. On name collision,
+# appends a timestamp (and PID if still colliding) so prior archived
+# entries are never overwritten.
+archive_path() {
+    local source="$1" label="$2"
+    local base target
+    base=$(basename "$source")
+    target="$ARCHIVE_PATH/$base"
+    if [[ -e "$target" ]]; then
+        target="$ARCHIVE_PATH/${base}.archived-$(date +%Y%m%d%H%M%S)"
+        if [[ -e "$target" ]]; then
+            target="${target}-$$"
+        fi
+    fi
+    if mv -- "$source" "$target"; then
+        log "$label: archived $source -> $target"
+        return 0
+    else
+        log "$label: ERROR failed to archive $source"
+        return 1
+    fi
+}
 
 # Counters / state
 promoted_weekly=0
 promoted_monthly=0
 promoted_yearly=0
-deleted_daily=0
-deleted_weekly=0
-deleted_monthly=0
-deleted_yearly=0
+archived_daily=0
+archived_weekly=0
+archived_monthly=0
+archived_yearly=0
 failed=0
 kept_safety=""
 warning=0
@@ -147,6 +177,7 @@ dailies_sorted=$(
         ! -path "$MONTHLY_PATH" \
         ! -path "$YEARLY_PATH" \
         ! -path "$LOGS_PATH" \
+        ! -path "$ARCHIVE_PATH" \
         -print0 |
     while IFS= read -r -d '' entry; do
         printf '%s\t%s\n' "$(mtime_of "$entry")" "$entry"
@@ -269,11 +300,9 @@ fi
 
 if (( ${#to_delete[@]} > 0 )); then
     for path in "${to_delete[@]}"; do
-        if rm -rf -- "$path"; then
-            log "daily: deleted $path"
-            deleted_daily=$((deleted_daily + 1))
+        if archive_path "$path" "daily"; then
+            archived_daily=$((archived_daily + 1))
         else
-            log "daily: ERROR failed to delete $path"
             failed=$((failed + 1))
         fi
     done
@@ -293,12 +322,10 @@ prune_tier() {
     while IFS=$'\t' read -r mtime path; do
         [[ -z "${path:-}" ]] && continue
         if (( i >= keep )); then
-            if rm -rf -- "$path"; then
-                log "$tier_label: deleted (retention) $path"
+            if archive_path "$path" "$tier_label (retention)"; then
                 current="${!counter_var}"
                 printf -v "$counter_var" '%d' $((current + 1))
             else
-                log "$tier_label: ERROR failed to delete $path"
                 failed=$((failed + 1))
             fi
         fi
@@ -306,9 +333,9 @@ prune_tier() {
     done <<< "$sorted"
 }
 
-prune_tier "$WEEKLY_PATH"  "$WEEKLY_RETENTION_WEEKS"    "weekly"  deleted_weekly
-prune_tier "$MONTHLY_PATH" "$MONTHLY_RETENTION_MONTHS"  "monthly" deleted_monthly
-prune_tier "$YEARLY_PATH"  "$YEARLY_RETENTION_YEARS"    "yearly"  deleted_yearly
+prune_tier "$WEEKLY_PATH"  "$WEEKLY_RETENTION_WEEKS"    "weekly"  archived_weekly
+prune_tier "$MONTHLY_PATH" "$MONTHLY_RETENTION_MONTHS"  "monthly" archived_monthly
+prune_tier "$YEARLY_PATH"  "$YEARLY_RETENTION_YEARS"    "yearly"  archived_yearly
 
 # ----- Summary -------------------------------------------------------------
 report "----- summary -----"
@@ -317,9 +344,10 @@ report "max daily age:       $MAX_BACKUP_AGE_DAYS day(s)"
 report "weekly retention:    $WEEKLY_RETENTION_WEEKS week(s)"
 report "monthly retention:   $MONTHLY_RETENTION_MONTHS month(s)"
 report "yearly retention:    $YEARLY_RETENTION_YEARS year(s)"
-report "dailies:             total=${#all_dailies_sorted[@]} kept_recent=${#recent_dailies[@]} deleted=$deleted_daily"
+report "dailies:             total=${#all_dailies_sorted[@]} kept_recent=${#recent_dailies[@]} archived=$archived_daily"
 report "promoted:            weekly=$promoted_weekly monthly=$promoted_monthly yearly=$promoted_yearly"
-report "tier deletions:      weekly=$deleted_weekly monthly=$deleted_monthly yearly=$deleted_yearly"
+report "tier archived:       weekly=$archived_weekly monthly=$archived_monthly yearly=$archived_yearly"
+report "archive dir:         $ARCHIVE_PATH"
 if [[ -n "$kept_safety" ]]; then
     report "kept (safety):       $kept_safety"
 fi
@@ -364,12 +392,16 @@ if (( SLACK_ENABLED )); then
 
     payload="{\"channel\":$(json_escape "$SLACK_CHANNEL"),\"text\":$(json_escape "$msg"),\"mrkdwn\":true}"
 
+    curl_args=(-sS --max-time 15 -X POST
+        -H "Authorization: Bearer $SLACK_TOKEN"
+        -H "Content-Type: application/json; charset=utf-8"
+        --data "$payload")
+    if [[ -n "$SLACK_HTTPS_PROXY" ]]; then
+        curl_args+=(--proxy "$SLACK_HTTPS_PROXY")
+    fi
+
     set +e
-    response=$(curl -sS --max-time 15 -X POST \
-        -H "Authorization: Bearer $SLACK_TOKEN" \
-        -H "Content-Type: application/json; charset=utf-8" \
-        --data "$payload" \
-        https://slack.com/api/chat.postMessage 2>&1)
+    response=$(curl "${curl_args[@]}" https://slack.com/api/chat.postMessage 2>&1)
     curl_status=$?
     set -e
 

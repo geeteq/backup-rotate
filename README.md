@@ -6,28 +6,36 @@ policy to a directory of daily backups, with optional Slack notifications.
 It assumes the target directory contains **daily backups** (files or
 directories) and manages three sibling subdirectories — `weekly/`,
 `monthly/`, `yearly/` — promoting and pruning them according to per-tier
-retention counts. All operations are also written to `logs/backups.log`
+retention counts. Nothing is ever erased: pruned entries are moved into
+`archive/` instead. All operations are also written to `logs/backups.log`
 inside the same directory.
 
 ## What it does, in order
 
 1. **Creates the tier subdirectories** (`weekly/`, `monthly/`, `yearly/`)
-   inside the backup directory if they do not already exist.
+   and the `archive/` directory inside the backup directory if they do
+   not already exist.
 2. **Promotes the newest daily** into each tier whose current period
    (ISO week / calendar month / calendar year) does not yet have a backup.
    - A daily that is a directory is archived to `<name>.tar.gz` in the
      tier subdir; its mtime is preserved with `touch -r`.
    - A daily that is already a file is copied as-is with `cp -a`.
-3. **Deletes dailies older than `MAX_BACKUP_AGE_DAYS`** in the top of the
-   backup directory. Tier and `logs/` subdirs are excluded from this scan.
+3. **Archives dailies older than `MAX_BACKUP_AGE_DAYS`** by moving them
+   into `archive/`. The tier, `logs/`, and `archive/` subdirs are
+   excluded from this scan.
 4. **Safety-keep**: if *every* daily is older than the cutoff, the most
    recent one is preserved and a `WARNING` is printed to stderr (and
    included in the Slack message). This prevents the script from leaving
    the directory empty if no new backups arrived for a while.
 5. **Prunes each tier subdir** to its retention count, keeping the
-   N newest by mtime.
+   N newest by mtime; everything else is moved to `archive/`.
 6. **Prints a summary** (one block at the end) and optionally posts it
    to Slack.
+
+Entries in `archive/` are never touched by the script. If two pruned
+entries would land on the same name, the second is renamed with a
+`.archived-<timestamp>` suffix so prior archived entries are never
+overwritten.
 
 Every line written by the script is teed to `<backup_dir>/logs/backups.log`
 in addition to stdout.
@@ -48,7 +56,7 @@ default. The shipped `config.env` documents every option.
 
 | Variable                   | Default     | Meaning                                                 |
 | -------------------------- | ----------- | ------------------------------------------------------- |
-| `MAX_BACKUP_AGE_DAYS`      | `5`         | Dailies older than this are deleted (with safety-keep). |
+| `MAX_BACKUP_AGE_DAYS`      | `5`         | Dailies older than this are moved to `archive/` (with safety-keep). |
 | `WEEKLY_RETENTION_WEEKS`   | `4`         | Number of weekly backups to keep.                       |
 | `MONTHLY_RETENTION_MONTHS` | `12`        | Number of monthly backups to keep.                      |
 | `YEARLY_RETENTION_YEARS`   | `5`         | Number of yearly backups to keep.                       |
@@ -57,13 +65,17 @@ default. The shipped `config.env` documents every option.
 | `YEARLY_DIRNAME`           | `yearly`    | Subdirectory name for yearly tier.                      |
 | `LOGS_DIRNAME`             | `logs`      | Subdirectory name for the log file.                     |
 | `LOG_FILENAME`             | `backups.log` | Log file written inside `LOGS_DIRNAME`.               |
+| `ARCHIVE_DIRNAME`          | `archive`   | Subdirectory where pruned entries are moved (never auto-cleaned). |
 | `SLACK_ENABLED`            | `0`         | Set to `1` to post a run summary to Slack.              |
 | `SLACK_TOKEN`              | (empty)     | Slack bot/user token (`xoxb-...`).                      |
 | `SLACK_CHANNEL`            | (empty)     | Target channel ID or name (e.g. `C0123…` or `#backups`).|
+| `SLACK_HTTPS_PROXY`        | (empty)     | Optional HTTPS proxy for the Slack call (e.g. `http://proxy.internal:3128`). |
 
 The Slack bot needs `chat:write` scope and must be a member of the channel.
-`config.env` is authoritative — values set there override the same names
-inherited from the environment.
+Set `SLACK_HTTPS_PROXY` if outbound HTTPS to `slack.com` must traverse a
+proxy — it is passed to `curl --proxy` for the Slack call only and does
+not affect any other network activity. `config.env` is authoritative —
+values set there override the same names inherited from the environment.
 
 ## Usage
 
@@ -115,7 +127,7 @@ Every operation produces one timestamped log line on stdout *and* in
 
 ```
 [2026-05-12 21:00:45] weekly: promoted (tar.gz) /var/backups/myapp/backup-2026-05-12 -> /var/backups/myapp/weekly/backup-2026-05-12.tar.gz
-[2026-05-12 21:00:45] daily: deleted /var/backups/myapp/backup-2026-05-03
+[2026-05-12 21:00:45] daily: archived /var/backups/myapp/backup-2026-05-03 -> /var/backups/myapp/archive/backup-2026-05-03
 ```
 
 The run ends with a summary block:
@@ -127,9 +139,10 @@ The run ends with a summary block:
 […] weekly retention:    4 week(s)
 […] monthly retention:   12 month(s)
 […] yearly retention:    5 year(s)
-[…] dailies:             total=4 kept_recent=2 deleted=2
+[…] dailies:             total=4 kept_recent=2 archived=2
 […] promoted:            weekly=1 monthly=1 yearly=1
-[…] tier deletions:      weekly=0 monthly=0 yearly=0
+[…] tier archived:       weekly=0 monthly=0 yearly=0
+[…] archive dir:         /var/backups/myapp/archive
 […] status:              ok
 ```
 
@@ -165,8 +178,12 @@ non-zero — the local rotation has already been performed.
 ## Notes & caveats
 
 - Daily backups are identified by being top-level entries of the backup
-  directory that are not one of the tier subdirectories or `logs/`.
-  Anything else you drop directly in `<backup_dir>` is treated as a daily.
+  directory that are not one of the tier subdirectories, `logs/`, or
+  `archive/`. Anything else you drop directly in `<backup_dir>` is
+  treated as a daily.
+- `archive/` grows without bound. Prune it manually when you're sure
+  the entries inside are no longer needed; the script will never touch
+  it.
 - Filenames containing newline characters are not supported (the script
   uses newline-delimited sorted output internally). Tabs are fine.
 - Tier pruning is mtime-based, not name-based. If you backdate a tier
