@@ -30,10 +30,13 @@ SLACK_HTTPS_PROXY="${SLACK_HTTPS_PROXY:-}"
 
 usage() {
     cat <<EOF
-Usage: $0 -d <backup_dir>
+Usage: $0 -d <backup_dir> [-n|--dry-run]
 
 Options:
   -d <backup_dir>   Base directory to rotate (required).
+  -n, --dry-run     Show what would be done without changing anything
+                    (no mkdir, no promotion, no archiving, no Slack POST,
+                    no log file write).
   -h, --help        Show this help.
 
 Configuration is read from:
@@ -42,6 +45,7 @@ EOF
 }
 
 BACKUP_DIR=""
+DRY_RUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -d)
@@ -53,6 +57,7 @@ while [[ $# -gt 0 ]]; do
             BACKUP_DIR="$2"
             shift 2
             ;;
+        -n|--dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
     esac
@@ -90,11 +95,16 @@ if [[ ! -d "$BACKUP_DIR" ]]; then
     exit 1
 fi
 
-# Tee all subsequent stdout/stderr to a per-backup-dir log file.
+# Tee all subsequent stdout/stderr to a per-backup-dir log file
+# (skipped under --dry-run so nothing is written to disk).
 LOGS_PATH="$BACKUP_DIR/$LOGS_DIRNAME"
 LOG_FILE="$LOGS_PATH/$LOG_FILENAME"
-mkdir -p "$LOGS_PATH"
-exec > >(tee -a "$LOG_FILE") 2>&1
+if (( DRY_RUN )); then
+    log "DRY-RUN: no changes will be made; would log to $LOG_FILE"
+else
+    mkdir -p "$LOGS_PATH"
+    exec > >(tee -a "$LOG_FILE") 2>&1
+fi
 
 # Accumulator for lines that should also appear in the Slack message.
 report_lines=()
@@ -126,13 +136,21 @@ ARCHIVE_PATH="$BACKUP_DIR/$ARCHIVE_DIRNAME"
 
 for d in "$WEEKLY_PATH" "$MONTHLY_PATH" "$YEARLY_PATH"; do
     if [[ ! -d "$d" ]]; then
-        mkdir -p "$d"
-        log "created tier directory: $d"
+        if (( DRY_RUN )); then
+            log "[dry-run] would create tier directory: $d"
+        else
+            mkdir -p "$d"
+            log "created tier directory: $d"
+        fi
     fi
 done
 if [[ ! -d "$ARCHIVE_PATH" ]]; then
-    mkdir -p "$ARCHIVE_PATH"
-    log "created archive directory: $ARCHIVE_PATH"
+    if (( DRY_RUN )); then
+        log "[dry-run] would create archive directory: $ARCHIVE_PATH"
+    else
+        mkdir -p "$ARCHIVE_PATH"
+        log "created archive directory: $ARCHIVE_PATH"
+    fi
 fi
 
 # Moves a path into the archive instead of deleting it. On name collision,
@@ -148,6 +166,10 @@ archive_path() {
         if [[ -e "$target" ]]; then
             target="${target}-$$"
         fi
+    fi
+    if (( DRY_RUN )); then
+        log "[dry-run] $label: would archive $source -> $target"
+        return 0
     fi
     if mv -- "$source" "$target"; then
         log "$label: archived $source -> $target"
@@ -205,6 +227,7 @@ fi
 tier_has_current_backup() {
     # Returns 0 if $tier_dir contains any entry with mtime >= $period_start.
     local tier_dir="$1" period_start="$2" entry m
+    [[ -d "$tier_dir" ]] || return 1
     while IFS= read -r -d '' entry; do
         m=$(mtime_of "$entry")
         if (( m >= period_start )); then
@@ -229,6 +252,11 @@ promote_to_tier() {
             printf -v "$result_var" '%d' 0
             return 0
         fi
+        if (( DRY_RUN )); then
+            log "[dry-run] $tier_label: would promote (tar.gz) $source -> $target"
+            printf -v "$result_var" '%d' 1
+            return 0
+        fi
         parent=$(dirname "$source")
         if tar -C "$parent" -czf "$target" "$base" 2>/dev/null; then
             touch -r "$source" "$target" 2>/dev/null || true
@@ -247,6 +275,11 @@ promote_to_tier() {
         if [[ -e "$target" ]]; then
             log "$tier_label: target exists, skipping promotion: $target"
             printf -v "$result_var" '%d' 0
+            return 0
+        fi
+        if (( DRY_RUN )); then
+            log "[dry-run] $tier_label: would promote (copy) $source -> $target"
+            printf -v "$result_var" '%d' 1
             return 0
         fi
         if cp -a -- "$source" "$target"; then
@@ -313,6 +346,7 @@ fi
 prune_tier() {
     local tier_dir="$1" keep="$2" tier_label="$3" counter_var="$4"
     local sorted i=0 mtime path current
+    [[ -d "$tier_dir" ]] || return 0
     sorted=$(
         find "$tier_dir" -mindepth 1 -maxdepth 1 -print0 |
         while IFS= read -r -d '' entry; do
@@ -360,6 +394,9 @@ if (( warning )); then
 else
     report "status:              ok"
 fi
+if (( DRY_RUN )); then
+    report "mode:                DRY-RUN (no changes were made)"
+fi
 
 # ----- Slack notification --------------------------------------------------
 json_escape() {
@@ -393,24 +430,28 @@ if (( SLACK_ENABLED )); then
 
     payload="{\"channel\":$(json_escape "$SLACK_CHANNEL"),\"text\":$(json_escape "$msg"),\"mrkdwn\":true}"
 
-    curl_args=(-sS --max-time 15 -X POST
-        -H "Authorization: Bearer $SLACK_TOKEN"
-        -H "Content-Type: application/json; charset=utf-8"
-        --data "$payload")
-    if [[ -n "$SLACK_HTTPS_PROXY" ]]; then
-        curl_args+=(--proxy "$SLACK_HTTPS_PROXY")
-    fi
-
-    set +e
-    response=$(curl "${curl_args[@]}" https://slack.com/api/chat.postMessage 2>&1)
-    curl_status=$?
-    set -e
-
-    if (( curl_status != 0 )); then
-        log "slack: ERROR curl failed (exit $curl_status): $response"
-    elif [[ "$response" == *'"ok":true'* ]]; then
-        log "slack: notification posted to $SLACK_CHANNEL"
+    if (( DRY_RUN )); then
+        log "[dry-run] slack: would post notification to $SLACK_CHANNEL"
     else
-        log "slack: ERROR API rejected message: $response"
+        curl_args=(-sS --max-time 15 -X POST
+            -H "Authorization: Bearer $SLACK_TOKEN"
+            -H "Content-Type: application/json; charset=utf-8"
+            --data "$payload")
+        if [[ -n "$SLACK_HTTPS_PROXY" ]]; then
+            curl_args+=(--proxy "$SLACK_HTTPS_PROXY")
+        fi
+
+        set +e
+        response=$(curl "${curl_args[@]}" https://slack.com/api/chat.postMessage 2>&1)
+        curl_status=$?
+        set -e
+
+        if (( curl_status != 0 )); then
+            log "slack: ERROR curl failed (exit $curl_status): $response"
+        elif [[ "$response" == *'"ok":true'* ]]; then
+            log "slack: notification posted to $SLACK_CHANNEL"
+        else
+            log "slack: ERROR API rejected message: $response"
+        fi
     fi
 fi

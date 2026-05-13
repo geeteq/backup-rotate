@@ -80,20 +80,27 @@ values set there override the same names inherited from the environment.
 ## Usage
 
 ```
-./rotate-backups.sh -d <backup_dir>
+./rotate-backups.sh -d <backup_dir> [-n|--dry-run]
 ```
 
-`-d <backup_dir>` is the only argument and is required.
+`-d <backup_dir>` is required. `-n`/`--dry-run` previews the plan without
+changing anything on disk and without posting to Slack — every line that
+would mutate state is logged with a `[dry-run]` prefix, and no log file
+is written either.
 
 ### Examples
 
 ```sh
 # Rotate /var/backups/myapp
 ./rotate-backups.sh -d /var/backups/myapp
+
+# Preview what a run would do, no changes
+./rotate-backups.sh -d /var/backups/myapp --dry-run
 ```
 
 To enable Slack notifications, set `SLACK_ENABLED=1` (plus `SLACK_TOKEN`
-and `SLACK_CHANNEL`) in `config.env` and run as normal.
+and `SLACK_CHANNEL`) in `config.env` and run as normal. Slack posting is
+also suppressed under `--dry-run`.
 
 ### Cron example
 
@@ -171,7 +178,7 @@ non-zero — the local rotation has already been performed.
 
 | Code | Meaning                                                                                    |
 | ---- | ------------------------------------------------------------------------------------------ |
-| 0    | Run completed (a warning was possibly logged).                                             |
+| 0    | Run completed (a warning was possibly logged; also returned for a successful `--dry-run`). |
 | 1    | `<backup_dir>` does not exist or is not a directory.                                       |
 | 2    | Missing/invalid CLI argument, or `SLACK_ENABLED=1` without `SLACK_TOKEN`/`SLACK_CHANNEL`, or `curl` not installed when Slack is enabled. |
 
