@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HPE OneView Appliance Status</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; color: #222; }
+  h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+  p.note { color: #666; font-size: .85rem; margin: 0 0 1rem; }
+  textarea { width: 100%; max-width: 720px; height: 140px; font-family: ui-monospace, Menlo, monospace; font-size: .9rem; padding: .5rem; box-sizing: border-box; }
+  button { padding: .5rem 1rem; font-size: .95rem; cursor: pointer; margin-top: .5rem; }
+  table { border-collapse: collapse; margin-top: 1.5rem; min-width: 720px; }
+  th, td { text-align: left; padding: .5rem .75rem; border-bottom: 1px solid #eee; font-size: .95rem; }
+  th { background: #fafafa; font-weight: 600; }
+  tr.down td { color: #b00020; }
+  tr.warn td { color: #a35d00; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: .5rem; vertical-align: middle; }
+  .dot.up { background: #1aaa55; }
+  .dot.warn { background: #f29100; }
+  .dot.down { background: #d32f2f; }
+  .dot.pending { background: #bbb; }
+  code { background: #f4f4f4; padding: 0 .25rem; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h1>HPE OneView Appliance Status</h1>
+<p class="note">
+  Enter one appliance URL per line (e.g. <code>https://oneview1.example.com</code>).
+  Browsers block cross-origin requests to self-signed appliances by default —
+  if a known-good appliance shows red, open its URL in a new tab once and accept the certificate, then re-check.
+</p>
+
+<textarea id="urls" placeholder="https://oneview1.example.com&#10;https://oneview2.example.com"></textarea>
+<br>
+<button id="check">Check status</button>
+
+<table id="results" hidden>
+  <thead>
+    <tr>
+      <th style="width: 50%">Appliance</th>
+      <th>Status</th>
+      <th>OneView version</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+  const STORAGE_KEY = "oneview-urls";
+  const urlsEl = document.getElementById("urls");
+  const tableEl = document.getElementById("results");
+  const tbodyEl = tableEl.querySelector("tbody");
+
+  urlsEl.value = localStorage.getItem(STORAGE_KEY) || "";
+
+  document.getElementById("check").addEventListener("click", run);
+
+  function run() {
+    const raw = urlsEl.value;
+    localStorage.setItem(STORAGE_KEY, raw);
+
+    const urls = raw.split(/\r?\n/).map(u => u.trim()).filter(Boolean);
+    tbodyEl.innerHTML = "";
+    tableEl.hidden = urls.length === 0;
+
+    urls.forEach(url => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${escapeHtml(url)}</td>
+        <td><span class="dot pending"></span><span class="status">checking…</span></td>
+        <td class="version">—</td>
+      `;
+      tbodyEl.appendChild(tr);
+      checkAppliance(url, tr);
+    });
+  }
+
+  async function checkAppliance(url, tr) {
+    const base = url.replace(/\/+$/, "");
+    const versionUrl = base + "/rest/version";
+    const statusCell = tr.querySelector(".status");
+    const dot = tr.querySelector(".dot");
+    const versionCell = tr.querySelector(".version");
+
+    try {
+      const res = await fetch(versionUrl, {
+        method: "GET",
+        headers: { "Accept": "application/json", "X-API-Version": "120" },
+        mode: "cors",
+        cache: "no-store",
+        redirect: "follow"
+      });
+
+      let version = null;
+      if (res.status === 200) {
+        try {
+          const data = await res.json();
+          if (data && data.currentVersion) {
+            version = `currentVersion ${data.currentVersion}` +
+              (data.minimumVersion ? ` (min ${data.minimumVersion})` : "");
+          }
+        } catch { /* non-JSON body */ }
+      }
+
+      if (version) {
+        mark(tr, "up", statusCell, "200 OK");
+        versionCell.textContent = version;
+      } else {
+        mark(tr, "warn", statusCell,
+          res.status === 200 ? "200 OK, no version" : `HTTP ${res.status}, no version`);
+        versionCell.textContent = "—";
+      }
+    } catch (err) {
+      mark(tr, "down", statusCell, "unreachable / blocked");
+      versionCell.textContent = "—";
+    }
+  }
+
+  function mark(tr, state, statusCell, label) {
+    tr.classList.toggle("down", state === "down");
+    tr.classList.toggle("warn", state === "warn");
+    const dot = tr.querySelector(".dot");
+    dot.classList.remove("pending", "up", "warn", "down");
+    dot.classList.add(state);
+    statusCell.textContent = label;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+  }
+</script>
+
+</body>
+</html>
