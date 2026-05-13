@@ -9,18 +9,13 @@ if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
 fi
 
-# Apply defaults for anything not provided by config.env or the environment.
+# Defaults applied for anything not set by config.env or the environment.
 MAX_BACKUP_AGE_DAYS="${MAX_BACKUP_AGE_DAYS:-5}"
-WEEKLY_RETENTION_WEEKS="${WEEKLY_RETENTION_WEEKS:-4}"
-MONTHLY_RETENTION_MONTHS="${MONTHLY_RETENTION_MONTHS:-12}"
-YEARLY_RETENTION_YEARS="${YEARLY_RETENTION_YEARS:-5}"
-
+DAILY_DIRNAME="${DAILY_DIRNAME:-daily}"
 WEEKLY_DIRNAME="${WEEKLY_DIRNAME:-weekly}"
-MONTHLY_DIRNAME="${MONTHLY_DIRNAME:-monthly}"
-YEARLY_DIRNAME="${YEARLY_DIRNAME:-yearly}"
+ARCHIVE_DIRNAME="${ARCHIVE_DIRNAME:-archive}"
 LOGS_DIRNAME="${LOGS_DIRNAME:-logs}"
 LOG_FILENAME="${LOG_FILENAME:-backups.log}"
-ARCHIVE_DIRNAME="${ARCHIVE_DIRNAME:-archive}"
 
 SLACK_ENABLED="${SLACK_ENABLED:-0}"
 SLACK_TOKEN="${SLACK_TOKEN:-}"
@@ -33,9 +28,9 @@ usage() {
 Usage: $0 -d <backup_dir> [-n|--dry-run]
 
 Options:
-  -d <backup_dir>   Base directory to rotate (required).
+  -d <backup_dir>   Base directory to manage (required).
   -n, --dry-run     Show what would be done without changing anything
-                    (no mkdir, no promotion, no archiving, no Slack POST,
+                    (no mkdir, no ingest, no archiving, no Slack POST,
                     no log file write).
   -h, --help        Show this help.
 
@@ -95,10 +90,12 @@ if [[ ! -d "$BACKUP_DIR" ]]; then
     exit 1
 fi
 
-# Tee all subsequent stdout/stderr to a per-backup-dir log file
-# (skipped under --dry-run so nothing is written to disk).
+DAILY_PATH="$BACKUP_DIR/$DAILY_DIRNAME"
+WEEKLY_PATH="$BACKUP_DIR/$WEEKLY_DIRNAME"
+ARCHIVE_PATH="$BACKUP_DIR/$ARCHIVE_DIRNAME"
 LOGS_PATH="$BACKUP_DIR/$LOGS_DIRNAME"
 LOG_FILE="$LOGS_PATH/$LOG_FILENAME"
+
 if (( DRY_RUN )); then
     log "DRY-RUN: no changes will be made; would log to $LOG_FILE"
 else
@@ -106,102 +103,112 @@ else
     exec > >(tee -a "$LOG_FILE") 2>&1
 fi
 
-# Accumulator for lines that should also appear in the Slack message.
+for d in "$DAILY_PATH" "$WEEKLY_PATH" "$ARCHIVE_PATH"; do
+    if [[ ! -d "$d" ]]; then
+        if (( DRY_RUN )); then
+            log "[dry-run] would create directory: $d"
+        else
+            mkdir -p "$d"
+            log "created directory: $d"
+        fi
+    fi
+done
+
 report_lines=()
 report() {
     log "$@"
     report_lines+=("$*")
 }
 
-# Portable mtime + date helpers (BSD/macOS vs GNU/Linux).
+# Portable mtime + ISO-week start (BSD/macOS vs GNU/Linux).
 if stat -f '%m' /dev/null >/dev/null 2>&1; then
-    mtime_of()       { stat -f '%m' "$1"; }
-    start_of_week()  { date -v-$(( $(date +%u) - 1 ))d -v0H -v0M -v0S +%s; }
-    start_of_month() { date -v1d -v0H -v0M -v0S +%s; }
-    start_of_year()  { date -v1m -v1d -v0H -v0M -v0S +%s; }
+    mtime_of()      { stat -f '%m' "$1"; }
+    start_of_week() { date -v-$(( $(date +%u) - 1 ))d -v0H -v0M -v0S +%s; }
 else
-    mtime_of()       { stat -c '%Y' "$1"; }
-    start_of_week()  { date -d "$(date +%Y-%m-%d) -$(( $(date +%u) - 1 )) days 00:00:00" +%s; }
-    start_of_month() { date -d "$(date +%Y-%m-01) 00:00:00" +%s; }
-    start_of_year()  { date -d "$(date +%Y-01-01) 00:00:00" +%s; }
+    mtime_of()      { stat -c '%Y' "$1"; }
+    start_of_week() { date -d "$(date +%Y-%m-%d) -$(( $(date +%u) - 1 )) days 00:00:00" +%s; }
 fi
 
 now=$(date +%s)
 cutoff=$(( now - MAX_BACKUP_AGE_DAYS * 86400 ))
-
-WEEKLY_PATH="$BACKUP_DIR/$WEEKLY_DIRNAME"
-MONTHLY_PATH="$BACKUP_DIR/$MONTHLY_DIRNAME"
-YEARLY_PATH="$BACKUP_DIR/$YEARLY_DIRNAME"
-ARCHIVE_PATH="$BACKUP_DIR/$ARCHIVE_DIRNAME"
-
-for d in "$WEEKLY_PATH" "$MONTHLY_PATH" "$YEARLY_PATH"; do
-    if [[ ! -d "$d" ]]; then
-        if (( DRY_RUN )); then
-            log "[dry-run] would create tier directory: $d"
-        else
-            mkdir -p "$d"
-            log "created tier directory: $d"
-        fi
-    fi
-done
-if [[ ! -d "$ARCHIVE_PATH" ]]; then
-    if (( DRY_RUN )); then
-        log "[dry-run] would create archive directory: $ARCHIVE_PATH"
-    else
-        mkdir -p "$ARCHIVE_PATH"
-        log "created archive directory: $ARCHIVE_PATH"
-    fi
-fi
-
-# Moves a path into the archive instead of deleting it. On name collision,
-# appends a timestamp (and PID if still colliding) so prior archived
-# entries are never overwritten.
-archive_path() {
-    local source="$1" label="$2"
-    local base target
-    base=$(basename "$source")
-    target="$ARCHIVE_PATH/$base"
-    if [[ -e "$target" ]]; then
-        target="$ARCHIVE_PATH/${base}.archived-$(date +%Y%m%d%H%M%S)"
-        if [[ -e "$target" ]]; then
-            target="${target}-$$"
-        fi
-    fi
-    if (( DRY_RUN )); then
-        log "[dry-run] $label: would archive $source -> $target"
-        return 0
-    fi
-    if mv -- "$source" "$target"; then
-        log "$label: archived $source -> $target"
-        return 0
-    else
-        log "$label: ERROR failed to archive $source"
-        return 1
-    fi
-}
+sow=$(start_of_week)
 
 # Counters / state
-promoted_weekly=0
-promoted_monthly=0
-promoted_yearly=0
+ingested=0
 archived_daily=0
-archived_weekly=0
-archived_monthly=0
-archived_yearly=0
+promoted_weekly=0
 failed=0
 kept_safety=""
 warning=0
 
-# ----- Collect dailies (top-level entries excluding tier subdirs) ----------
-dailies_sorted=$(
+# ===== Step 1: Ingest top-level entries into DAILY_PATH ====================
+ingest_one() {
+    local src="$1"
+    local base target parent
+    base=$(basename "$src")
+
+    if [[ -d "$src" ]]; then
+        target="$DAILY_PATH/${base}.tar.gz"
+        if [[ -e "$target" ]]; then
+            warn "ingest: target exists, skipping: $target"
+            return 0
+        fi
+        if (( DRY_RUN )); then
+            log "[dry-run] ingest: would tar+gz $src -> $target"
+            ingested=$((ingested + 1))
+            return 0
+        fi
+        parent=$(dirname "$src")
+        if tar -C "$parent" -czf "$target" "$base" 2>/dev/null; then
+            touch -r "$src" "$target" 2>/dev/null || true
+            rm -rf -- "$src"
+            log "ingest: tar+gz $src -> $target"
+            ingested=$((ingested + 1))
+            return 0
+        else
+            rm -f -- "$target"
+            log "ingest: ERROR failed to tar.gz $src"
+            failed=$((failed + 1))
+            return 1
+        fi
+    else
+        target="$DAILY_PATH/$base"
+        if [[ -e "$target" ]]; then
+            warn "ingest: target exists, skipping: $target"
+            return 0
+        fi
+        if (( DRY_RUN )); then
+            log "[dry-run] ingest: would move $src -> $target"
+            ingested=$((ingested + 1))
+            return 0
+        fi
+        if mv -- "$src" "$target"; then
+            log "ingest: moved $src -> $target"
+            ingested=$((ingested + 1))
+            return 0
+        else
+            log "ingest: ERROR failed to move $src"
+            failed=$((failed + 1))
+            return 1
+        fi
+    fi
+}
+
+while IFS= read -r -d '' entry; do
+    ingest_one "$entry" || true
+done < <(
     find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 \
+        ! -path "$DAILY_PATH" \
         ! -path "$WEEKLY_PATH" \
-        ! -path "$MONTHLY_PATH" \
-        ! -path "$YEARLY_PATH" \
-        ! -path "$LOGS_PATH" \
         ! -path "$ARCHIVE_PATH" \
+        ! -path "$LOGS_PATH" \
         ! -name 'config.env' \
-        -print0 |
+        -print0
+)
+
+# ===== Step 2: Collect dailies, split by age ==============================
+dailies_sorted=$(
+    [[ -d "$DAILY_PATH" ]] && find "$DAILY_PATH" -mindepth 1 -maxdepth 1 -print0 |
     while IFS= read -r -d '' entry; do
         printf '%s\t%s\n' "$(mtime_of "$entry")" "$entry"
     done | sort -rn
@@ -223,165 +230,98 @@ if [[ -n "$dailies_sorted" ]]; then
     done <<< "$dailies_sorted"
 fi
 
-# ----- Promotion -----------------------------------------------------------
-tier_has_current_backup() {
-    # Returns 0 if $tier_dir contains any entry with mtime >= $period_start.
-    local tier_dir="$1" period_start="$2" entry m
-    [[ -d "$tier_dir" ]] || return 1
-    while IFS= read -r -d '' entry; do
-        m=$(mtime_of "$entry")
-        if (( m >= period_start )); then
-            return 0
-        fi
-    done < <(find "$tier_dir" -mindepth 1 -maxdepth 1 -print0)
-    return 1
-}
-
-promote_to_tier() {
-    # promote_to_tier <source> <tier_dir> <tier_label> <result_var>
-    # Sets $result_var to 1 on success, 0 on no-op, -1 on failure.
-    local source="$1" tier_dir="$2" tier_label="$3" result_var="$4"
-    local base name target parent
-    base=$(basename "$source")
-
-    if [[ -d "$source" ]]; then
-        name="${base}.tar.gz"
-        target="$tier_dir/$name"
-        if [[ -e "$target" ]]; then
-            log "$tier_label: target exists, skipping promotion: $target"
-            printf -v "$result_var" '%d' 0
-            return 0
-        fi
-        if (( DRY_RUN )); then
-            log "[dry-run] $tier_label: would promote (tar.gz) $source -> $target"
-            printf -v "$result_var" '%d' 1
-            return 0
-        fi
-        parent=$(dirname "$source")
-        if tar -C "$parent" -czf "$target" "$base" 2>/dev/null; then
-            touch -r "$source" "$target" 2>/dev/null || true
-            log "$tier_label: promoted (tar.gz) $source -> $target"
-            printf -v "$result_var" '%d' 1
-            return 0
-        else
-            rm -f -- "$target"
-            log "$tier_label: ERROR failed to tar.gz $source"
-            printf -v "$result_var" '%d' -1
-            return 1
-        fi
-    else
-        name="$base"
-        target="$tier_dir/$name"
-        if [[ -e "$target" ]]; then
-            log "$tier_label: target exists, skipping promotion: $target"
-            printf -v "$result_var" '%d' 0
-            return 0
-        fi
-        if (( DRY_RUN )); then
-            log "[dry-run] $tier_label: would promote (copy) $source -> $target"
-            printf -v "$result_var" '%d' 1
-            return 0
-        fi
-        if cp -a -- "$source" "$target"; then
-            log "$tier_label: promoted (copy) $source -> $target"
-            printf -v "$result_var" '%d' 1
-            return 0
-        else
-            log "$tier_label: ERROR failed to copy $source"
-            printf -v "$result_var" '%d' -1
-            return 1
-        fi
-    fi
-}
-
-if (( ${#all_dailies_sorted[@]} > 0 )); then
-    newest_daily="${all_dailies_sorted[0]}"
-
-    sow=$(start_of_week)
-    som=$(start_of_month)
-    soy=$(start_of_year)
-
-    for tier in weekly monthly yearly; do
-        case "$tier" in
-            weekly)  tier_path="$WEEKLY_PATH";  period_start="$sow"; counter_var=promoted_weekly  ;;
-            monthly) tier_path="$MONTHLY_PATH"; period_start="$som"; counter_var=promoted_monthly ;;
-            yearly)  tier_path="$YEARLY_PATH";  period_start="$soy"; counter_var=promoted_yearly  ;;
-        esac
-        if tier_has_current_backup "$tier_path" "$period_start"; then
-            log "$tier: tier already has a backup for the current period, no promotion"
-        else
-            promote_to_tier "$newest_daily" "$tier_path" "$tier" "$counter_var" || \
-                failed=$((failed + 1))
-        fi
-    done
-else
-    log "no dailies present, skipping promotion"
-fi
-
-# ----- Daily retention (age-based, with safety-keep) -----------------------
-to_delete=()
+# ===== Step 3: Decide which dailies to archive (with safety-keep) =========
+to_archive=()
 if (( ${#recent_dailies[@]} == 0 )) && (( ${#old_dailies[@]} > 0 )); then
     kept_safety="${old_dailies[0]}"
     warning=1
     if (( ${#old_dailies[@]} > 1 )); then
-        to_delete=("${old_dailies[@]:1}")
+        to_archive=("${old_dailies[@]:1}")
     fi
-    warn "no dailies newer than ${MAX_BACKUP_AGE_DAYS} day(s) in '$BACKUP_DIR'."
+    warn "no dailies newer than ${MAX_BACKUP_AGE_DAYS} day(s) in '$DAILY_PATH'."
     warn "preserving most recent daily to avoid removing the last valid one: $kept_safety"
 elif (( ${#old_dailies[@]} > 0 )); then
-    to_delete=("${old_dailies[@]}")
+    to_archive=("${old_dailies[@]}")
 fi
 
-if (( ${#to_delete[@]} > 0 )); then
-    for path in "${to_delete[@]}"; do
-        if archive_path "$path" "daily"; then
-            archived_daily=$((archived_daily + 1))
+# ===== Step 4: Weekly promotion (before archive so the source still exists) =
+# The newest of the entries we're about to archive is copied into WEEKLY_PATH,
+# but only if no weekly snapshot already covers the current ISO week.
+if (( ${#to_archive[@]} > 0 )); then
+    newest_pruned="${to_archive[0]}"   # to_archive is newest-first
+
+    weekly_has_current=0
+    if [[ -d "$WEEKLY_PATH" ]]; then
+        while IFS= read -r -d '' entry; do
+            m=$(mtime_of "$entry")
+            if (( m >= sow )); then
+                weekly_has_current=1
+                break
+            fi
+        done < <(find "$WEEKLY_PATH" -mindepth 1 -maxdepth 1 -print0)
+    fi
+
+    if (( weekly_has_current )); then
+        log "weekly: snapshot for current ISO week already exists, skipping"
+    else
+        base=$(basename "$newest_pruned")
+        weekly_target="$WEEKLY_PATH/$base"
+        if [[ -e "$weekly_target" ]]; then
+            log "weekly: target exists, skipping promotion: $weekly_target"
+        elif (( DRY_RUN )); then
+            log "[dry-run] weekly: would copy $newest_pruned -> $weekly_target"
+            promoted_weekly=1
+        elif cp -a -- "$newest_pruned" "$weekly_target"; then
+            touch -r "$newest_pruned" "$weekly_target" 2>/dev/null || true
+            log "weekly: promoted $newest_pruned -> $weekly_target"
+            promoted_weekly=1
         else
+            log "weekly: ERROR failed to copy $newest_pruned"
             failed=$((failed + 1))
         fi
-    done
+    fi
 fi
 
-# ----- Tier retention (count-based, keep N newest) -------------------------
-prune_tier() {
-    local tier_dir="$1" keep="$2" tier_label="$3" counter_var="$4"
-    local sorted i=0 mtime path current
-    [[ -d "$tier_dir" ]] || return 0
-    sorted=$(
-        find "$tier_dir" -mindepth 1 -maxdepth 1 -print0 |
-        while IFS= read -r -d '' entry; do
-            printf '%s\t%s\n' "$(mtime_of "$entry")" "$entry"
-        done | sort -rn
-    )
-    [[ -z "$sorted" ]] && return 0
-    while IFS=$'\t' read -r mtime path; do
-        [[ -z "${path:-}" ]] && continue
-        if (( i >= keep )); then
-            if archive_path "$path" "$tier_label (retention)"; then
-                current="${!counter_var}"
-                printf -v "$counter_var" '%d' $((current + 1))
-            else
-                failed=$((failed + 1))
-            fi
+# ===== Step 5: Archive the old dailies ====================================
+archive_path() {
+    local source="$1"
+    local base target
+    base=$(basename "$source")
+    target="$ARCHIVE_PATH/$base"
+    if [[ -e "$target" ]]; then
+        target="$ARCHIVE_PATH/${base}.archived-$(date +%Y%m%d%H%M%S)"
+        if [[ -e "$target" ]]; then
+            target="${target}-$$"
         fi
-        i=$((i + 1))
-    done <<< "$sorted"
+    fi
+    if (( DRY_RUN )); then
+        log "[dry-run] daily: would archive $source -> $target"
+        return 0
+    fi
+    if mv -- "$source" "$target"; then
+        log "daily: archived $source -> $target"
+        return 0
+    else
+        log "daily: ERROR failed to archive $source"
+        return 1
+    fi
 }
 
-prune_tier "$WEEKLY_PATH"  "$WEEKLY_RETENTION_WEEKS"    "weekly"  archived_weekly
-prune_tier "$MONTHLY_PATH" "$MONTHLY_RETENTION_MONTHS"  "monthly" archived_monthly
-prune_tier "$YEARLY_PATH"  "$YEARLY_RETENTION_YEARS"    "yearly"  archived_yearly
+for path in "${to_archive[@]}"; do
+    if archive_path "$path"; then
+        archived_daily=$((archived_daily + 1))
+    else
+        failed=$((failed + 1))
+    fi
+done
 
-# ----- Summary -------------------------------------------------------------
+# ===== Step 6: Summary ====================================================
 report "----- summary -----"
 report "directory:           $BACKUP_DIR"
 report "max daily age:       $MAX_BACKUP_AGE_DAYS day(s)"
-report "weekly retention:    $WEEKLY_RETENTION_WEEKS week(s)"
-report "monthly retention:   $MONTHLY_RETENTION_MONTHS month(s)"
-report "yearly retention:    $YEARLY_RETENTION_YEARS year(s)"
+report "ingested:            $ingested"
 report "dailies:             total=${#all_dailies_sorted[@]} kept_recent=${#recent_dailies[@]} archived=$archived_daily"
-report "promoted:            weekly=$promoted_weekly monthly=$promoted_monthly yearly=$promoted_yearly"
-report "tier archived:       weekly=$archived_weekly monthly=$archived_monthly yearly=$archived_yearly"
+report "promoted to weekly:  $promoted_weekly"
 report "archive dir:         $ARCHIVE_PATH"
 if [[ -n "$kept_safety" ]]; then
     report "kept (safety):       $kept_safety"
@@ -398,7 +338,7 @@ if (( DRY_RUN )); then
     report "mode:                DRY-RUN (no changes were made)"
 fi
 
-# ----- Slack notification --------------------------------------------------
+# ===== Step 7: Slack notification =========================================
 json_escape() {
     # Minimal JSON string escaper. Wraps the result in quotes.
     local s="$1"
